@@ -49,6 +49,8 @@ struct wpa_driver_wext_data {
 	int errors;
 	int driver_is_started;
 	int bgscan_enabled;
+	int host_asleep;
+	int scan_channels;
 #endif /* ANDROID */
 };
 

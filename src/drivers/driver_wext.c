@@ -44,6 +44,7 @@ static int wpa_driver_wext_set_auth_alg(void *priv, int auth_alg);
 extern int wpa_driver_wext_driver_cmd(void *priv, char *cmd, char *buf,
                                        size_t buf_len);
 extern int wpa_driver_signal_poll(void *priv, struct wpa_signal_info *si);
+extern int wpa_driver_get_max_scan_ssids(void);
 #endif
 
 
@@ -236,9 +237,10 @@ int wpa_driver_wext_set_freq(void *priv, int freq)
 
 
 static void
-wpa_driver_wext_event_wireless_custom(void *ctx, char *custom)
+wpa_driver_wext_event_wireless_custom(struct wpa_driver_wext_data *drv, char *custom)
 {
 	union wpa_event_data data;
+	void *ctx = drv->ctx;
 
 	wpa_printf(MSG_MSGDUMP, "WEXT: Custom wireless event: '%s'",
 		   custom);
@@ -295,6 +297,51 @@ wpa_driver_wext_event_wireless_custom(void *ctx, char *custom)
 	done:
 		os_free(resp_ies);
 		os_free(req_ies);
+
+//Atheros
+	} else if (strncmp(custom, "PRE-AUTH", 8) == 0) {
+		u8 res;
+		int bytes;
+		char *spos;
+
+		spos = custom + 8;
+
+		bytes = strspn(spos, "0123456789abcdefABCDEF");
+		if (!bytes || (bytes & 1))
+			return;
+		bytes /= 2;
+
+		if (bytes < 8)
+			return;
+
+		hexstr2bin(spos, data.pmkid_candidate.bssid, ETH_ALEN);
+		spos += ETH_ALEN * 2;
+		hexstr2bin(spos, &res, 1);
+		data.pmkid_candidate.index = res;
+		spos += 2;
+		hexstr2bin(spos, &res, 1);
+		data.pmkid_candidate.preauth = res;
+		wpa_supplicant_event(ctx, EVENT_PMKID_CANDIDATE, &data);
+	} else if (strncmp(custom, "ASSOCRESPIE=", 12) == 0) {
+		int bytes;
+		char *spos;
+
+		spos = custom + 12;
+		bytes = strspn(spos, "0123456789abcdefABCDEF");
+		if (!bytes || (bytes & 1))
+			return;
+		bytes /= 2;
+
+		free(drv->assoc_resp_ies);
+		drv->assoc_resp_ies = malloc(bytes);
+		if (drv->assoc_resp_ies == NULL) {
+			drv->assoc_resp_ies_len = 0;
+			return;
+		}
+		hexstr2bin(spos, drv->assoc_resp_ies, bytes);
+		drv->assoc_resp_ies_len = bytes;
+//Atheros 
+
 #ifdef CONFIG_PEERKEY
 	} else if (os_strncmp(custom, "STKSTART.request=", 17) == 0) {
 		if (hwaddr_aton(custom + 17, data.stkstart.peer)) {
@@ -448,7 +495,7 @@ static void wpa_driver_wext_event_wireless(struct wpa_driver_wext_data *drv,
 		 * before processing. */
 		os_memcpy(&iwe_buf, pos, IW_EV_LCP_LEN);
 		wpa_printf(MSG_DEBUG, "Wireless event: cmd=0x%x len=%d",
-			   iwe->cmd, iwe->len);
+			   iwe->cmd, iwe->len, drv->we_version_compiled);
 		if (iwe->len <= IW_EV_LCP_LEN)
 			return;
 
@@ -504,13 +551,20 @@ static void wpa_driver_wext_event_wireless(struct wpa_driver_wext_data *drv,
 		case IWEVCUSTOM:
 			if (custom + iwe->u.data.length > end) {
 				wpa_printf(MSG_DEBUG, "WEXT: Invalid "
-					   "IWEVCUSTOM length");
+					   "IWEVCUSTOM length: len:%d, maxlen:%d, 					data='%.16s'",iwe->u.data.length, end-custom, custom);
 				return;
 			}
-			buf = dup_binstr(custom, iwe->u.data.length);
+			buf = os_malloc(iwe->u.data.length + 1);
 			if (buf == NULL)
 				return;
-			wpa_driver_wext_event_wireless_custom(drv->ctx, buf);
+			os_memcpy(buf, custom, iwe->u.data.length);
+			buf[iwe->u.data.length] = '\0';
+#ifdef ANDROID
+			if (os_strncmp(buf, "HOST_ASLEEP=", 12) == 0) {
+				drv->host_asleep = (os_strncmp(buf+12, "asleep", 6)==0);
+			}
+#endif
+			wpa_driver_wext_event_wireless_custom(drv, buf);
 			os_free(buf);
 			break;
 		case SIOCGIWSCAN:
@@ -822,6 +876,9 @@ void * wpa_driver_wext_init(void *ctx, const char *ifname)
 		return NULL;
 	drv->ctx = ctx;
 	os_strlcpy(drv->ifname, ifname, sizeof(drv->ifname));
+#ifdef ANDROID
+	drv->scan_channels = 11;
+#endif
 
 	os_snprintf(path, sizeof(path), "/sys/class/net/%s/phy80211", ifname);
 	if (stat(path, &buf) == 0) {
@@ -1138,6 +1195,8 @@ struct wext_scan_data {
 static void wext_get_scan_mode(struct iw_event *iwe,
 			       struct wext_scan_data *res)
 {
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWMODE: mode=%d",iwe->u.mode);	
+
 	if (iwe->u.mode == IW_MODE_ADHOC)
 		res->res.caps |= IEEE80211_CAP_IBSS;
 	else if (iwe->u.mode == IW_MODE_MASTER || iwe->u.mode == IW_MODE_INFRA)
@@ -1149,9 +1208,16 @@ static void wext_get_scan_ssid(struct iw_event *iwe,
 			       struct wext_scan_data *res, char *custom,
 			       char *end)
 {
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWESSID: essid_len=%d, flags=0x%x",
+			iwe->u.essid.length, iwe->u.essid.flags);
+
 	int ssid_len = iwe->u.essid.length;
 	if (custom + ssid_len > end)
+	{
+		wpa_printf(MSG_ERROR, "SIOCGIWESSID: overflow: len:%d, maxlen=%d, toplen=%d",
+			iwe->u.essid.length, end - custom, IW_ESSID_MAX_SIZE);
 		return;
+	}
 	if (iwe->u.essid.flags &&
 	    ssid_len > 0 &&
 	    ssid_len <= IW_ESSID_MAX_SIZE) {
@@ -1165,6 +1231,9 @@ static void wext_get_scan_freq(struct iw_event *iwe,
 			       struct wext_scan_data *res)
 {
 	int divi = 1000000, i;
+
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWFREQ: freq_e=%d, freq_m=%d",
+			iwe->u.freq.e, iwe->u.freq.m);
 
 	if (iwe->u.freq.e == 0) {
 		/*
@@ -1206,6 +1275,9 @@ static void wext_get_scan_qual(struct wpa_driver_wext_data *drv,
 			       struct iw_event *iwe,
 			       struct wext_scan_data *res)
 {
+	wpa_printf(MSG_MSGDUMP, "IWEVQUAL: qual=%d, noise=%d, level=%d",
+			iwe->u.qual.qual, iwe->u.qual.noise, iwe->u.qual.level);
+
 	res->res.qual = iwe->u.qual.qual;
 	res->res.noise = iwe->u.qual.noise;
 	res->res.level = iwe->u.qual.level;
@@ -1231,6 +1303,9 @@ static void wext_get_scan_qual(struct wpa_driver_wext_data *drv,
 static void wext_get_scan_encode(struct iw_event *iwe,
 				 struct wext_scan_data *res)
 {
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWENCODE: flags=0x%x",
+			iwe->u.data.flags);
+
 	if (!(iwe->u.data.flags & IW_ENCODE_DISABLED))
 		res->res.caps |= IEEE80211_CAP_PRIVACY;
 }
@@ -1245,9 +1320,15 @@ static void wext_get_scan_rate(struct iw_event *iwe,
 	struct iw_param p;
 	size_t clen;
 
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWRATE");
+
 	clen = iwe->len;
 	if (custom + clen > end)
+	{
+		wpa_printf(MSG_ERROR, "SIOCGIWRATE: overflow: len:%d, maxlen=%d",
+			iwe->len, end - custom);
 		return;
+	}
 	maxrate = 0;
 	while (((ssize_t) clen) >= (ssize_t) sizeof(struct iw_param)) {
 		/* Note: may be misaligned, make a local, aligned copy */
@@ -1271,6 +1352,8 @@ static void wext_get_scan_iwevgenie(struct iw_event *iwe,
 {
 	char *genie, *gpos, *gend;
 	u8 *tmp;
+
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWEVGENIE");
 
 	if (iwe->u.data.length == 0)
 		return;
@@ -1297,6 +1380,8 @@ static void wext_get_scan_custom(struct iw_event *iwe,
 {
 	size_t clen;
 	u8 *tmp;
+
+	wpa_printf(MSG_MSGDUMP, "SIOCGIWEVCUSTOM");
 
 	clen = iwe->u.data.length;
 	if (custom + clen > end)
@@ -1464,6 +1549,9 @@ struct wpa_scan_results * wpa_driver_wext_get_scan_results(void *priv)
 		/* Event data may be unaligned, so make a local, aligned copy
 		 * before processing. */
 		os_memcpy(&iwe_buf, pos, IW_EV_LCP_LEN);
+
+		wpa_printf(MSG_MSGDUMP, "Event: CMD=0x%x, Len=%d, we_version_compiled:%d",iwe->cmd,iwe->len,drv->we_version_compiled);
+
 		if (iwe->len <= IW_EV_LCP_LEN)
 			break;
 
@@ -1537,6 +1625,7 @@ static int wpa_driver_wext_get_range(void *priv)
 	struct iwreq iwr;
 	int minlen;
 	size_t buflen;
+	int retries = 10, err;
 
 	/*
 	 * Use larger buffer than struct iw_range in order to allow the
@@ -1555,7 +1644,20 @@ static int wpa_driver_wext_get_range(void *priv)
 	minlen = ((char *) &range->enc_capa) - (char *) range +
 		sizeof(range->enc_capa);
 
-	if (ioctl(drv->ioctl_sock, SIOCGIWRANGE, &iwr) < 0) {
+	/* give some time so the interface wakes up - otherwise, 
+	   we don't get reliable results... */
+	while (retries-- > 0) {
+	if (ioctl(drv->ioctl_sock, SIOCGIWRANGE, &iwr) >= 0) {
+			break;
+		} else {
+			sleep(1);
+			wpa_printf(MSG_DEBUG, "ioctl[SIOCGIWRANGE]");
+		}
+	};
+	
+	if ((err = ioctl(drv->ioctl_sock, SIOCGIWRANGE, &iwr)) < 0) {
+
+		wpa_printf(MSG_INFO, "SIOCGIWRANGE: failed: error=%d", err);
 		perror("ioctl[SIOCGIWRANGE]");
 		os_free(range);
 		return -1;
@@ -1588,14 +1690,18 @@ static int wpa_driver_wext_get_range(void *priv)
 		drv->capa.auth = WPA_DRIVER_AUTH_OPEN |
 			WPA_DRIVER_AUTH_SHARED |
 			WPA_DRIVER_AUTH_LEAP;
+#ifdef ANDROID
+		drv->capa.max_scan_ssids = wpa_driver_get_max_scan_ssids();
+#else
 		drv->capa.max_scan_ssids = 1;
+#endif
 
 		wpa_printf(MSG_DEBUG, "  capabilities: key_mgmt 0x%x enc 0x%x "
 			   "flags 0x%x",
 			   drv->capa.key_mgmt, drv->capa.enc, drv->capa.flags);
 	} else {
 		wpa_printf(MSG_DEBUG, "SIOCGIWRANGE: too old (short) data - "
-			   "assuming WPA is not supported");
+			   "assuming WPA is not supported: len:%d, min:%d",iwr.u.data.length, minlen);
 	}
 
 	drv->max_level = range->max_qual.level;
